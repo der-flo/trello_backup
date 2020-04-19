@@ -1,46 +1,128 @@
+# frozen_string_literal: true
+
+require 'forwardable'
 require 'open-uri'
 require 'json'
 require 'yaml'
 require 'fileutils'
+require 'pathname'
 
-backup_path = "backups/#{Date.today}"
-FileUtils.mkdir_p backup_path
+class Helpers # rubocop:disable Style/Documentation
+  extend Forwardable
+  def_delegator :'self.class', :request
 
-$config = YAML.load_file('config.yml')
+  def self.config
+    @config ||= YAML.load_file(File.expand_path('~/.trello_backup.yml'))
+  end
 
-def request path, params = ''
-  auth = "key=#{$config['developer_public_key']}&" \
-         "token=#{$config['member_token']}"
-  prefix = 'https://api.trello.com/1/'
-  url = "#{prefix}#{path}?#{auth}&#{params}"
+  # https://developer.atlassian.com/cloud/trello/rest/
+  def self.request(path, params = '')
+    auth = "key=#{config['developer_public_key']}&" \
+           "token=#{config['member_token']}"
+    prefix = 'https://api.trello.com/1/'
+    url = "#{prefix}#{path}?#{auth}&#{params}"
 
-  JSON.parse(open(url).read)
+    JSON.parse(URI.open(url).read)
+  end
+
+  # Aus https://github.com/rails/rails/blob/157920aead96865e3135f496c09ace607d5620dc/activestorage/app/models/active_storage/filename.rb#L57
+  def sanitize_filename(name)
+    name
+      .encode(Encoding::UTF_8, invalid: :replace, undef: :replace, replace: '�')
+      .strip
+      .tr("\u{202E}%$|:;/\t\r\n\\", '-')
+  end
+
+  def write(json:, to:)
+    IO.write(to, JSON.pretty_generate(json))
+  end
 end
 
-def sanitize_filename name
-  name.gsub(/[^a-zA-Z0-9\.\-\+_]/, '_')
-end
+class Board < Helpers # rubocop:disable Style/Documentation
+  def initialize(id)
+    @id = id
+  end
 
-request('members/me/boards').each do |b|
-  response = request "boards/#{b['id']}",
-                     'cards=all&lists=all&checklists=all&' \
-                     'actions=all&actions_limit=1000&' \
-                     'action_member=false&action_memberCreator=false'
+  def self.all
+    request('members/me/boards').map { |data| Board.new(data['id']) }
+  end
 
-  board_pathname = File.join(backup_path, sanitize_filename(response['name']))
-  IO.write("#{board_pathname}.json", JSON.pretty_generate(response))
+  def dump_to(backup_path)
+    response = request "boards/#{@id}", 'cards=all&lists=all&checklists=all'
 
-  # Backup attachments
-  response['actions']
-    .select { |action| action['type'] == 'addAttachmentToCard' }
-    .select do |action|
-      url = action['data']['attachment']['url']
-      url && url.include?('trello-attachments')
+    board_path = backup_path / sanitize_filename(response['name'])
+    FileUtils.mkdir board_path
+
+    write json: response, to: "#{board_path}.json"
+
+    response['cards'].each do |card|
+      Card.new(card).dump_to board_path
     end
-    .each do |action|
-      attachment = action['data']['attachment']
-      FileUtils.mkdir_p board_pathname
-      IO.write("#{board_pathname}/#{attachment['name']}",
-               open(attachment['url']).read)
-    end
+  end
 end
+
+class Card < Helpers # rubocop:disable Style/Documentation
+  def initialize(data)
+    @data = data
+  end
+
+  def dump_to(base_path)
+    dump_actions_to(base_path)
+    dump_attachments_to(base_path)
+  end
+
+  private
+
+  def dump_attachments_to(base_path)
+    return unless attachments?
+
+    path = card_path base_path
+    write json: attachment_data, to: path / 'attachments.json'
+    uploaded_attachments.each do |attachment|
+      IO.write(path / attachment['name'], URI.open(attachment['url']).read)
+    end
+  end
+
+  def dump_actions_to(base_path)
+    return unless comments?
+
+    path = card_path base_path
+    write json: action_data, to: path / 'actions.json'
+
+    # https://developer.atlassian.com/cloud/trello/guides/rest-api/rate-limits/
+    sleep 0.1
+  end
+
+  def attachments?
+    !@data['badges']['attachments'].zero?
+  end
+
+  def attachment_data
+    @attachment_data ||= request 'attachments'
+  end
+
+  def comments?
+    !@data['badges']['comments'].zero?
+  end
+
+  def action_data
+    request 'actions'
+  end
+
+  def uploaded_attachments
+    attachment_data.select { |attachment| attachment['isUpload'] }
+  end
+
+  def card_path(base_path)
+    path = base_path / sanitize_filename(@data['name'])
+    FileUtils.mkdir_p path
+    path
+  end
+
+  def request(sub_resource)
+    super "cards/#{@data['id']}/#{sub_resource}"
+  end
+end
+
+backup_path = Pathname.new Dir.pwd
+Board.all.each { |board| board.dump_to backup_path }

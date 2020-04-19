@@ -1,0 +1,3 @@
+backups/
+.bundle/
+Gemfile.lock
